@@ -18,12 +18,13 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
+from vllm_omni.diffusion.attention.adapter import StepScheduledAttention, validate_sparse_role
 from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
-from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
+from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role, get_sparse_attn_backend
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.layout import assert_backend_layout_supported
@@ -50,6 +51,7 @@ def _try_extract_layer_index(prefix: str) -> int | None:
 class Attention(nn.Module):
     _scheduler_paged_kv = False
     _has_custom_attention = False
+    step_scheduled: StepScheduledAttention | None = None
 
     def __init__(
         self,
@@ -273,6 +275,53 @@ class Attention(nn.Module):
         # Per-layer opt-out from KV-cache quantization (set by model author).
         self._disable_kv_quant: bool = disable_kv_quant
         self._init_kv_cache_quantization(config)
+        self._init_step_scheduled_sparse(config)
+
+    def _init_step_scheduled_sparse(self, config) -> None:
+        spec = self.attn_spec.sparse if self.attn_spec is not None else None
+        if spec is None:
+            return
+        if self._scheduler_paged_kv and self.paged_kv_cache_role is not None:
+            raise ValueError("Step-scheduled sparse attention does not support Scheduler-managed paged KV.")
+        if self._kv_cache_dtype not in (None, "float"):
+            raise ValueError("Step-scheduled sparse attention does not support KV-cache quantization.")
+        assert self.attn_backend is not None
+        parallel_config = getattr(config, "parallel_config", None)
+        sparse_backend = get_sparse_attn_backend(spec, self.head_size)
+        capabilities = validate_sparse_role(
+            spec=spec,
+            dense_backend=self.attn_backend,
+            sparse_backend=sparse_backend,
+            head_size=self.head_size,
+            causal=self.causal,
+            qkv_layout=self.qkv_layout,
+            ulysses_degree=getattr(parallel_config, "ulysses_degree", 1),
+            ring_degree=getattr(parallel_config, "ring_degree", 1),
+            allgather_degree=getattr(parallel_config, "allgather_degree", 1),
+            skip_sequence_parallel=self.skip_sequence_parallel,
+        )
+        self.step_scheduled = StepScheduledAttention(
+            spec=spec,
+            sparse_backend=sparse_backend,
+            capabilities=capabilities,
+            num_heads=self.num_heads,
+            head_size=self.head_size,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
+            num_kv_heads=self.num_kv_heads,
+            qkv_layout=self.qkv_layout,
+            prefix=self.prefix,
+            role=self.role,
+            dense_backend_name=self.attn_backend.get_name(),
+        )
+        logger.info(
+            "Attention(role=%s, layer=%s): dense %s before denoise step %d, sparse %s from then on",
+            self.role,
+            self.prefix,
+            self.attn_backend.get_name(),
+            spec.start_step,
+            sparse_backend.get_name(),
+        )
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         """Return native rank-local geometry for an opted-in paged cache."""
@@ -522,6 +571,11 @@ class Attention(nn.Module):
             return cast(nn.Module, self.attention)(query, key, value, attn_metadata)
 
         self._assert_metadata_compatible(attn_metadata)
+
+        # Sparse steps never reach the dense compatibility fallbacks below.
+        step_scheduled = getattr(self, "step_scheduled", None)
+        if step_scheduled is not None and step_scheduled.select_sparse():
+            return step_scheduled.forward_sparse(query, key, value, attn_metadata)
 
         if (
             self.allow_fp32_fallback

@@ -10,6 +10,31 @@ import torch
 from vllm_omni.platforms import current_omni_platform
 
 
+@dataclass(frozen=True, slots=True)
+class SparseAdapterCapabilities:
+    """What a backend accepts when it runs the sparse steps of a step-scheduled role.
+
+    The role's dense backend decides how models build attention metadata, and
+    the same metadata reaches the sparse backend during sparse steps. Each flag
+    therefore states which metadata contract the sparse kernel consumes exactly,
+    with no dense fallback inside the kernel.
+    """
+
+    platforms: frozenset[str]
+    dtypes: frozenset[torch.dtype]
+    # Q/K/V layouts the kernel accepts; None accepts every layout the model uses.
+    qkv_layouts: frozenset[str] | None = None
+    causal: bool = False
+    attention_mask: bool = False
+    piecewise_spans: bool = False
+    packed_mask_free: bool = False
+    prefix_kv_slicing: bool = False
+    multi_doc_packed_varlen: bool = False
+    # Runs on the full-sequence, head-sharded tensors produced by Ulysses all-to-all.
+    ulysses: bool = False
+    option_keys: frozenset[str] = frozenset()
+
+
 class AttentionBackend(ABC):
     """Abstract class for diffusion attention backends."""
 
@@ -80,6 +105,11 @@ class AttentionBackend(ABC):
         """
         del attention_spec
         return False
+
+    @classmethod
+    def get_sparse_adapter_capabilities(cls) -> "SparseAdapterCapabilities | None":
+        """Capabilities as the sparse side of ``AttentionSpec.sparse``; None if unsupported."""
+        return None
 
     @staticmethod
     @abstractmethod

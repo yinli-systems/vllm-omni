@@ -2034,6 +2034,40 @@ class BlockSparseSpec:
 
 
 @dataclass
+class SparseAttentionSpec:
+    """Step-scheduled sparse attention for one attention role.
+
+    Denoise steps ``< start_step`` run the role's dense backend; every step from
+    ``start_step`` onward runs ``backend`` in every layer of the role. The step
+    index is read from the forward context, never inferred from call counts.
+    ``options`` are passed to the sparse backend implementation, which owns
+    their validation.
+    """
+
+    backend: str
+    start_step: int = 0
+    options: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.backend, str) or not self.backend.strip():
+            raise TypeError(f"sparse.backend must be a non-empty str; got {self.backend!r}.")
+        if self.backend.lower() == "auto":
+            raise ValueError("sparse.backend must name a backend explicitly; 'auto' is not allowed.")
+        if type(self.start_step) is not int or self.start_step < 0:
+            raise ValueError(f"sparse.start_step must be an int >= 0; got {self.start_step!r}.")
+        if self.options is None:
+            self.options = {}
+        if not isinstance(self.options, Mapping):
+            raise TypeError(f"sparse.options must be a dict; got {type(self.options)!r}.")
+        if not all(isinstance(key, str) for key in self.options):
+            raise TypeError("sparse.options keys must be str.")
+        self.options = dict(self.options)
+
+    def use_sparse(self, step_idx: int) -> bool:
+        return step_idx >= self.start_step
+
+
+@dataclass
 class AttentionSpec:
     """Specifies a backend and its typed backend-specific config for one attention role."""
 
@@ -2042,6 +2076,7 @@ class AttentionSpec:
     quant: AttnQuantSpec | None = None
     fastvideo_vsa_topk: int | None = None
     block_sparse: BlockSparseSpec | None = None
+    sparse: SparseAttentionSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -2050,6 +2085,7 @@ class AttentionSpec:
         self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
         self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
+        self.sparse = self._coerce(self.sparse, SparseAttentionSpec, "sparse")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
@@ -2073,6 +2109,11 @@ class AttentionSpec:
             raise ValueError(
                 f"block_sparse is only supported by the {sorted(BLOCK_SPARSE_BACKENDS)} backends, but "
                 f"backend={self.backend!r}. Remove block_sparse or set a supported backend."
+            )
+        if self.sparse is not None and self.backend.upper() in BLOCK_SPARSE_BACKENDS:
+            raise ValueError(
+                f"sparse cannot be combined with backend={self.backend!r}, which schedules its own sparse steps. "
+                "Use a dense backend with sparse, or configure block_sparse alone."
             )
 
     @staticmethod
@@ -2187,7 +2228,7 @@ class AttentionConfig:
             normalized[role] = node
             return
 
-        spec_keys = {"backend", "skip_softmax", "quant", "fastvideo_vsa_topk", "block_sparse"}
+        spec_keys = {"backend", "skip_softmax", "quant", "fastvideo_vsa_topk", "block_sparse", "sparse"}
         node_dict = dict(node)
         node_keys = set(node_dict)
         if node_keys & spec_keys:

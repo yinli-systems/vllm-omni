@@ -21,7 +21,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 
 if TYPE_CHECKING:
-    from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+    from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, SparseAttentionSpec
 
 logger = init_logger(__name__)
 
@@ -181,3 +181,12 @@ def get_attn_backend_for_capability(
 
         return DiffusionAttentionBackendEnum[spec.backend.upper()].get_class()
     return _cached_get_backend_cls(None, HEAD_SIZE_UNKNOWN)
+
+
+def get_sparse_attn_backend(spec: SparseAttentionSpec, head_size: int) -> type[AttentionBackend]:
+    """Resolve the backend for the sparse steps of ``AttentionSpec.sparse``.
+
+    Uses the same platform validation as an explicit dense selection, so a
+    missing kernel package or unsupported device fails before model build.
+    """
+    return _cached_get_backend_cls(spec.backend, head_size)

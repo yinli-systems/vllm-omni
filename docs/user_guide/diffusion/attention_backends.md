@@ -108,6 +108,40 @@ Backend-specific typed blocks are documented with their consumers:
 - `skip_softmax`: [TRTLLM Skip-Softmax](attention_backends/trtllm.md#skip-softmax).
 - `block_sparse`: [RainFusion](attention_backends/rainfusion.md#configuration).
 - `fastvideo_vsa_topk`: [FastVideo VSA](attention_backends/fastvideo_vsa.md#choose-top-k).
+- `sparse`: [step-scheduled sparse attention](#step-scheduled-sparse-attention).
+
+### Step-scheduled sparse attention
+
+`sparse` keeps a role on its dense `backend` for the first denoise steps and
+switches every layer of that role to a sparse backend from `start_step` on
+(steps are zero-indexed; `start_step=2` runs steps 0 and 1 dense). `options`
+are passed to the sparse backend, which rejects keys it does not know.
+
+```bash
+vllm-omni serve <model> --enforce-eager \
+  --diffusion-attention-config \
+  '{"per_role":{"self":{"backend":"FLASH_ATTN","sparse":{"backend":"<SPARSE_BACKEND>","start_step":10,"options":{}}}}}'
+```
+
+The switch is decided from the pipeline's published `denoise_step_idx`, so all
+layers and ranks agree within a step; a forward without a step index raises.
+A sparse backend opts in through `AttentionBackend.get_sparse_adapter_capabilities()`.
+The layer is rejected at build time when the sparse backend cannot consume the
+metadata the dense backend lets models emit (packed mask-free layouts, K/V
+prefix slicing, multi-document packing), cannot run on the platform, head size,
+layout or Ulysses tensors, or does not know an option. During sparse steps a
+mask, piecewise span or dtype the sparse backend does not support raises
+instead of falling back to dense attention.
+
+Current scope: eager execution, single-device and pure Ulysses attention. Ring,
+AllGather-KV, Scheduler-managed paged KV, KV-cache quantization and compiled
+graphs are rejected. A `per_role` entry also applies to roles that fall back to
+its category: MiniMax-H3's `minimax_h3.token_refiner` has category `self`, so
+give it its own dense entry to keep it out of the switch.
+
+`vllm_omni.diffusion.attention.adapter.record_attention_dispatch()` records the
+path and backend of every call of a step-scheduled role in the current process,
+which tests and benchmarks use to verify which kernel actually ran.
 
 ## Platform defaults
 
