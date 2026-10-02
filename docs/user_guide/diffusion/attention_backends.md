@@ -139,6 +139,19 @@ graphs are rejected. A `per_role` entry also applies to roles that fall back to
 its category: MiniMax-H3's `minimax_h3.token_refiner` has category `self`, so
 give it its own dense entry to keep it out of the switch.
 
+`SPARGE_ATTN` ([SpargeAttn](https://github.com/thu-ml/SpargeAttn), training-free
+block-sparse SageAttention2) implements the sparse side. Its options are `topk`
+(fraction of key blocks kept per query block, default 0.5), `simthreshd1`,
+`cdfthreshd`, `pvthreshd`, and `log_sparsity_every` (log the measured block
+sparsity every N calls per layer). Build SpargeAttn from a revision that
+launches its CUDA kernels on the current PyTorch stream; vLLM workers use a
+dedicated stream and older builds fail with illegal memory accesses.
+
+```bash
+--diffusion-attention-config \
+  '{"per_role":{"self":{"backend":"FLASH_ATTN","sparse":{"backend":"SPARGE_ATTN","start_step":10,"options":{"topk":0.3}}},"minimax_h3.token_refiner":{"backend":"FLASH_ATTN"}}}'
+```
+
 `vllm_omni.diffusion.attention.adapter.record_attention_dispatch()` records the
 path and backend of every call of a step-scheduled role in the current process,
 which tests and benchmarks use to verify which kernel actually ran.
